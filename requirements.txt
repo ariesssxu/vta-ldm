@@ -1,0 +1,8 @@
+moviepy
+datasets
+tqdm
+torch
+numpy
+diffusers
+transformers
+opencv-python
