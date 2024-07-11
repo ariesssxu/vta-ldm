@@ -1,5 +1,8 @@
-# VTA_LDM
-<a href='https://arxiv.org/abs/2406.04350'>
+# Video-to-Audio Generation with Hidden Alignment  
+Manjie Xu, Chenxing Li, Yong Ren, Rilin Chen, Yu Gu, Wei Liang, Dong Yu  
+Tencent AI Lab  
+
+<a href='https://arxiv.org/abs/2407.07464'>
   <img src='https://img.shields.io/badge/Paper-Arxiv-green?style=plastic&logo=arXiv&logoColor=green' alt='Paper Arxiv'>
 </a>
 <a href='https://sites.google.com/view/vta-ldm/home'>
@@ -52,5 +55,17 @@ This work is based on some of the great repos:
 [Audioldm](https://github.com/haoheliu/AudioLDM)  
 
 ## Cite us
-🕳️
+```
+@misc{xu2024vta-ldm,  
+      title={Video-to-Audio Generation with Hidden Alignment},   
+      author={Manjie Xu and Chenxing Li and Yong Ren and Rilin Chen and Yu Gu and Wei Liang and Dong Yu},
+      year={2024},
+      eprint={2407.07464},
+      archivePrefix={arXiv},
+      url={https://arxiv.org/abs/2407.07464}, 
+}
+```
+## Disclaimer
+
+This is not an official product by Tencent Ltd.
 
