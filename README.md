@@ -56,7 +56,7 @@ For data preparation, please refer to line 268 in `train.py`, which demonstrates
 {"video_path": xxx, "feature_file": xxx, "audio_file": xxx, "description": xxx}
 ...
 ``` 
-For video-to-audio experiments, only "video_path" and "audio_file" are mandatory. A reference preprocessing routine is available in tools/data_tools.py (line 70).
+For video-to-audio experiments, only "video_path" and "audio_file" are mandatory. A reference preprocessing routine is available in `tools/data_tools.py` (line 70).
 
 And then just run:
 ```
