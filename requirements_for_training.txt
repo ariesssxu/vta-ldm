@@ -6,6 +6,3 @@ numpy
 diffusers
 transformers
 opencv-python
-accelerate
-deepspeed
-wandb

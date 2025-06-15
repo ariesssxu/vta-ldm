@@ -43,10 +43,28 @@ bash inference_from_video.sh
 You can custom the hyperparameters to fit your personal requirements. We also provide a script that can help merge the generated audio content with the original video based on ffmpeg:
 
 ```
-bash tools/merge_video_audio
+bash tools/merge_video_audio.sh
 ```
 ## Training 
-TBD. Code Coming Soon.
+Our training code is built on the accelerate framework for efficient, distributed training. We provide a simple training example in `train.py` and a basic starting script in `train.sh`. The training script includes our experimental trials with different audio encoders and supports multiple modalities.
+
+For data preparation, please refer to line 268 in `train.py`, which demonstrates how we load and process the dataset. Briefly, the dataloader expects your data configuration to be split into three separate files: `train/valid/test.jsonl`. Each of these files should list your data samples (one per line) in the following format:
+```
+# train.jsonl
+{"video_path": xxx, "feature_file": xxx, "audio_file": xxx, "description": xxx}
+{"video_path": xxx, "feature_file": xxx, "audio_file": xxx, "description": xxx}
+{"video_path": xxx, "feature_file": xxx, "audio_file": xxx, "description": xxx}
+...
+``` 
+For video-to-audio experiments, only "video_path" and "audio_file" are mandatory. A reference preprocessing routine is available in tools/data_tools.py (line 70).
+
+And then just run:
+```
+bash train.sh
+```
+Extracting key frames from videos during training can be a significant bottleneck, primarily due to I/O limitations when reading video files on the server we used. In our workflow, we extract key frames in advance to speed up training. Please refer to `tools/data_tools.py` (line 23) for more details.
+
+The training should be finished in 3 days using 8 nvidia a100 cards. 
 
 ## Ack
 This work is based on some of the great repos:  
