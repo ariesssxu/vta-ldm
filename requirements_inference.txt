@@ -1,0 +1,18 @@
+# Minimal dependencies for inference_from_video.py (Python 3.10).
+# Install the CUDA-compatible torch packages for your machine first when needed.
+torch
+torchvision
+diffusers==0.29.2
+transformers==4.41.2
+accelerate>=0.30,<2
+huggingface-hub>=0.23,<1
+safetensors>=0.3
+numpy>=1.23.5,<1.25
+scipy
+librosa>=0.10
+soundfile
+opencv-python-headless>=4.8,<4.12
+Pillow
+einops
+tqdm
+progressbar2

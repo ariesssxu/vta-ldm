@@ -1,20 +1,18 @@
 import os
-import copy
+# Keep third-party caches writable in restricted/containerized environments.
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/vta-ldm-numba")
+os.environ.setdefault("HF_HOME", "/tmp/vta-ldm-huggingface")
+
 import json
-import time
 import torch
 import argparse
-from PIL import Image
+import random
+from pathlib import Path
 import numpy as np
 import soundfile as sf
-#import wandb
 from tqdm import tqdm
-from diffusers import DDPMScheduler
-from models import build_pretrained_models, AudioDiffusion
-from transformers import AutoProcessor, ClapModel
-import torchaudio
-import tools.torch_tools as torch_tools
-from datasets import load_dataset
+from models import build_pretrained_models, AudioDiffusion, load_scheduler
+from tools.video_tools import load_video
 
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
@@ -22,13 +20,12 @@ class dotdict(dict):
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
     
-def chunks(lst, n):
-    """Yield successive n-sized chunks from lst."""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Inference for text to audio generation task.")
+    parser.add_argument(
+        "--config", type=Path, default=None,
+        help="Optional JSON config. Explicit CLI arguments override its values."
+    )
     parser.add_argument(
         "--original_args", type=str, default=None,
         help="Path for summary jsonl file saved during training."
@@ -36,6 +33,10 @@ def parse_args():
     parser.add_argument(
         "--model", type=str, default=None,
         help="Path for saved model bin file."
+    )
+    parser.add_argument(
+        "--scheduler_config", type=str, default=None,
+        help="Local scheduler JSON; avoids fetching the gated SD 2.1 repository."
     )
     parser.add_argument(
         "--vae_model", type=str, default="audioldm-s-full",
@@ -73,35 +74,72 @@ def parse_args():
         "--data_path", type=str, default="data/video_processed/video_gt_augment",
         help="inference data path"
     )
-    
-    args = parser.parse_args()
+    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda"], default="auto",
+        help="Execution device. 'auto' selects CUDA when available."
+    )
+
+    preliminary, _ = parser.parse_known_args(argv)
+    if preliminary.config is not None:
+        with preliminary.config.open(encoding="utf-8") as handle:
+            defaults = json.load(handle)
+        known = {action.dest for action in parser._actions}
+        unknown = sorted(set(defaults) - known)
+        if unknown:
+            parser.error("unknown config keys: {}".format(", ".join(unknown)))
+        parser.set_defaults(**defaults)
+
+    args = parser.parse_args(argv)
+    if args.num_steps < 1 or args.batch_size < 1:
+        parser.error("num_steps and batch_size must be positive")
+    if args.guidance <= 1:
+        parser.error("the released video model requires guidance > 1")
+    if args.num_samples != 1:
+        parser.error("minimal inference currently requires num_samples=1")
+    if args.num_test_instances == 0 or args.num_test_instances < -1:
+        parser.error("num_test_instances must be -1 or a positive integer")
 
     return args
 
 def main():
     args = parse_args()
-    
-    train_args = dotdict(json.loads(open(args.original_args).readlines()[0]))
+    if args.original_args is None or args.model is None:
+        raise ValueError("--original_args and --model are required")
+    for path, label in ((args.original_args, "training config"), (args.model, "model checkpoint")):
+        if not os.path.isfile(path):
+            raise FileNotFoundError("{} not found: {}".format(label, path))
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    device_name = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
+    if device_name == "auto":
+        device_name = "cpu"
+    device = torch.device(device_name)
+
+    with open(args.original_args, encoding="utf-8") as handle:
+        first_line = handle.readline()
+    train_args = dotdict(json.loads(first_line))
+    if args.scheduler_config:
+        train_args.scheduler_name = args.scheduler_config
     if "hf_model" not in train_args:
         train_args["hf_model"] = None
     
     # Load Models #
     name = train_args.vae_model
     vae, stft = build_pretrained_models(name)
-    vae, stft = vae.cuda(), stft.cuda()
+    vae, stft = vae.to(device), stft.to(device)
     model_class = AudioDiffusion
-    if train_args.ib:
-        print("*****USING MODEL IMAGEBIND*****")
-        from models_imagebind import AudioDiffusion_IB
-        model_class = AudioDiffusion if not train_args.ib else AudioDiffusion_IB
-    elif train_args.lb:
-        print("*****USING MODEL LANGUAGEBIND*****")
-        from models_languagebind import AudioDiffusion_LB
-        model_class = AudioDiffusion_LB
-    elif train_args.jepa:
-        print("*****USING MODEL JEPA*****")
-        from models_vjepa import AudioDiffusion_JEPA
-        model_class = AudioDiffusion_JEPA
+    variants = [name for name in ("ib", "lb", "jepa", "cavp", "vivit", "denseav", "of")
+                if train_args.get(name, False)]
+    if variants:
+        raise ValueError(
+            "minimal inference supports the released base model only; "
+            "disabled variants: {}".format(", ".join(variants))
+        )
 
     model = model_class(
         train_args.fea_encoder_name, 
@@ -120,51 +158,35 @@ def main():
     model.eval()
 
     # Load Trained Weight #
-    device = torch.device("cuda:0") #vae.device()
     if args.model.endswith(".pt") or args.model.endswith(".bin"):
-        model.load_state_dict(torch.load(args.model), strict=False)
+        model.load_state_dict(torch.load(args.model, map_location="cpu"), strict=False)
     else:
         from safetensors.torch import load_model
         load_model(model, args.model, strict=False)
         
     model.to(device)
     
-    scheduler = DDPMScheduler.from_pretrained(train_args.scheduler_name, subfolder="scheduler")
+    scheduler = load_scheduler(train_args.scheduler_name)
     sample_rate = args.sample_rate
     #evaluator = EvaluationHelper(16000, "cuda:0")
     
 
-    def audio_text_matching(waveforms, text, sample_freq=24000, max_len_in_seconds=10):
-        new_freq = 48000
-        resampled = []
-        
-        for wav in waveforms:
-            x = torchaudio.functional.resample(torch.tensor(wav, dtype=torch.float).reshape(1, -1), orig_freq=sample_freq, new_freq=new_freq)[0].numpy()
-            resampled.append(x[:new_freq*max_len_in_seconds])
-
-        inputs = clap_processor(text=text, audios=resampled, return_tensors="pt", padding=True, sampling_rate=48000)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = clap(**inputs)
-
-        logits_per_audio = outputs.logits_per_audio
-        ranks = torch.argsort(logits_per_audio.flatten(), descending=True).cpu().numpy()
-        return ranks
-    
-    # Load Data #
-    if train_args.prefix:
-        prefix = train_args.prefix
-    else:
-        prefix = ""
-
-    # data_path = "data/video_test/"
+    # Load a deterministic, bounded list of videos.
     data_path = args.data_path
-    wavname = [f"{name.split('.')[0]}.wav" for name in os.listdir(data_path)]
+    supported = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    video_files = sorted(
+        name for name in os.listdir(data_path)
+        if os.path.splitext(name)[1].lower() in supported
+    )
+    if args.num_test_instances > 0:
+        video_files = video_files[:args.num_test_instances]
+    if not video_files:
+        raise ValueError("no supported videos found in {}".format(data_path))
+    wavname = [f"{os.path.splitext(name)[0]}.wav" for name in video_files]
     video_features = []
-    for video_file in os.listdir(data_path):
+    for video_file in video_files:
         video_path = os.path.join(data_path, video_file)
-        video_feature = torch_tools.load_video(video_path, frame_rate=2, size=224)
+        video_feature = load_video(video_path, frame_rate=2, size=224)
         print(video_feature.shape)
         video_features.append(video_feature)
     
@@ -192,30 +214,15 @@ def main():
             all_outputs += [item for item in wave]
             
     # Save #
-    exp_id = str(int(time.time()))
-    if not os.path.exists("outputs"):
-        os.makedirs("outputs")
+    os.makedirs(args.save_dir, exist_ok=True)
     
     if num_samples == 1:
-        output_dir = "{}/{}_{}_steps_{}_guidance_{}_sampleRate_{}_augment".format(args.save_dir, exp_id, "_".join(args.model.split("/")[1:-1]), num_steps, guidance, sample_rate)
+        output_dir = "{}/steps_{}_guidance_{}_seed_{}".format(
+            args.save_dir, num_steps, guidance, args.seed
+        )
         os.makedirs(output_dir, exist_ok=True)
         for j, wav in enumerate(all_outputs):
             sf.write("{}/{}".format(output_dir, wavname[j]), wav, samplerate=sample_rate)
-            
-    else:
-        for i in range(num_samples):
-            output_dir = "{}/{}_{}_steps_{}_guidance_{}_sampleRate_{}/rank_{}".format(args.save_dir, exp_id, "_".join(args.model.split("/")[1:-1]), num_steps, guidance, sample_rate, i+1)
-            os.makedirs(output_dir, exist_ok=True)
-        
-        groups = list(chunks(all_outputs, num_samples))
-        for k in tqdm(range(len(groups))):
-            wavs_for_text = groups[k]
-            rank = audio_text_matching(wavs_for_text, text_prompts[k])
-            ranked_wavs_for_text = [wavs_for_text[r] for r in rank]
-            
-            for i, wav in enumerate(ranked_wavs_for_text):
-                output_dir = "{}/{}_{}_steps_{}_guidance_{}_sampleRate_{}/rank_{}".format(args.save_dir, exp_id, "_".join(args.model.split("/")[1:-1]), num_steps, guidance, sample_rate, i+1)
-                sf.write("{}/{}".format(output_dir, wavname[k]), wav, samplerate=sample_rate)
             
 if __name__ == "__main__":
     main()

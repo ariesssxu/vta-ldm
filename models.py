@@ -1,14 +1,12 @@
 import random
-import numpy as np
-from tqdm import tqdm
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from einops import repeat
-import time
-from tools.torch_tools import wav_to_fbank, sinusoidal_positional_embedding
+import json
+from torch.nn.utils.rnn import pad_sequence
+from tqdm import tqdm
 
 from audioldm.audio.stft import TacotronSTFT
 from audioldm.variational_autoencoder import AutoencoderKL
@@ -25,6 +23,25 @@ from diffusers import DDPMScheduler, UNet2DConditionModel
 from diffusers import AutoencoderKL as DiffuserAutoencoderKL
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode, RandomResizedCrop
 from diffusers import AudioLDMPipeline
+
+
+def sinusoidal_positional_embedding(token_sequence_size, token_embedding_dim, n=10000.0):
+    if token_embedding_dim % 2:
+        raise ValueError("token_embedding_dim must be even")
+    positions = torch.arange(token_sequence_size).unsqueeze(1)
+    denominators = torch.pow(n, 2 * torch.arange(token_embedding_dim // 2) / token_embedding_dim)
+    embeddings = torch.zeros(token_sequence_size, token_embedding_dim)
+    embeddings[:, 0::2] = torch.sin(positions / denominators)
+    embeddings[:, 1::2] = torch.cos(positions / denominators)
+    return embeddings
+
+
+def load_scheduler(source):
+    """Load either a local scheduler JSON or a Diffusers model directory/id."""
+    if os.path.isfile(source):
+        with open(source, encoding="utf-8") as handle:
+            return DDPMScheduler.from_config(json.load(handle))
+    return DDPMScheduler.from_pretrained(source, subfolder="scheduler")
 
 def build_pretrained_models(name):
     checkpoint = torch.load(name, map_location="cpu")
@@ -100,7 +117,11 @@ class Clip4Video(nn.Module):
 
         input_dim = 512 if "clip-vit-base" in model else 768
         self.linear_layer = nn.Linear(input_dim, embedding_dim)
-        self.pe = sinusoidal_positional_embedding(30, input_dim) if pe else None
+        self.register_buffer(
+            "pe",
+            sinusoidal_positional_embedding(30, input_dim) if pe else None,
+            persistent=False,
+        )
         print("*****PE*****") if pe else print("*****W/O PE*****")
 
     def forward(self, text=None, image=None, video=None):
@@ -113,7 +134,10 @@ class Clip4Video(nn.Module):
             out = self.clip_vision(video.to(self.clip_vision.device))          # input video x: t * 3 * w * h
             out = out.image_embeds        # t * 512
             if self.pe is not None:
-                out = out + self.pe[:out.shape[0], :].to(self.clip_vision.device)
+                position = self.pe
+                if out.shape[0] > position.shape[0]:
+                    position = sinusoidal_positional_embedding(out.shape[0], out.shape[1])
+                out = out + position[:out.shape[0]].to(device=out.device, dtype=out.dtype)
             # out['last_hidden_state'].shape # t * 50 * 768
             # out['image_embeds'].shape      # t * 512
         elif text is not None and video is not None:
@@ -159,8 +183,8 @@ class AudioDiffusion(nn.Module):
         self.pe = pe
 
         # https://huggingface.co/docs/diffusers/v0.14.0/en/api/schedulers/overview
-        self.noise_scheduler = DDPMScheduler.from_pretrained(self.scheduler_name, subfolder="scheduler")
-        self.inference_scheduler = DDPMScheduler.from_pretrained(self.scheduler_name, subfolder="scheduler")
+        self.noise_scheduler = load_scheduler(self.scheduler_name)
+        self.inference_scheduler = load_scheduler(self.scheduler_name)
 
         if unet_model_config_path:
             unet_config = UNet2DConditionModel.load_config(unet_model_config_path)
@@ -286,29 +310,20 @@ class AudioDiffusion(nn.Module):
         return encoder_hidden_states, boolean_encoder_mask
     
     def encode_video(self, video_batch, text=None, device=None):
-        vid_feas = []
-        for i, video in enumerate(video_batch):
-            if text:
-                vid_fea = self.vid_fea_extractor(video=video, text=text[i]) # t * fea_dim
-            else:
-                vid_fea = self.vid_fea_extractor(video=video)
-            vid_feas.append(vid_fea)
-        
-        padding = 0
-        size = max(v.size(0) for v in vid_feas)
-        batch_size = len(vid_feas)
-        embed_size = vid_feas[0].size(1)
-        encoder_hidden_states = vid_feas[0].new(batch_size, size, embed_size).fill_(padding)
-        boolean_encoder_mask = torch.ones((batch_size, size), dtype=torch.bool)
+        features = [
+            self.vid_fea_extractor(video=video, text=text[i] if text else None)
+            for i, video in enumerate(video_batch)
+        ]
+        return self._pad_video_features(features, device)
 
-        def copy_tensor(src, dst):
-            assert dst.numel() == src.numel()
-            dst.copy_(src)
-
-        for i, v in enumerate(vid_feas):
-            copy_tensor(v, encoder_hidden_states[i][: len(v)])
-            boolean_encoder_mask[i, len(v):] = False    
-        return encoder_hidden_states.to(device), boolean_encoder_mask.to(device)
+    @staticmethod
+    def _pad_video_features(features, device):
+        """Pad variable-length videos and return a mask matching real frames."""
+        lengths = torch.tensor([feature.shape[0] for feature in features], device=device)
+        hidden_states = pad_sequence(features, batch_first=True).to(device)
+        steps = torch.arange(hidden_states.shape[1], device=device)
+        attention_mask = steps.unsqueeze(0) < lengths.unsqueeze(1)
+        return hidden_states, attention_mask
 
     def encode_text_CLIP(self, prompt, device):
         # tmp_image = np.ones((512, 512, 3))
@@ -394,7 +409,6 @@ class AudioDiffusion(nn.Module):
     @torch.no_grad()
     def inference(self, inference_scheduler, text=None, video=None, image=None, num_steps=20, guidance_scale=3, num_samples_per_prompt=1, 
                   disable_progress=True, device=None):
-        start = time.time()
         classifier_free_guidance = guidance_scale > 1.0
 
         #print("ldm time 0", time.time()-start, prompt)
@@ -419,13 +433,20 @@ class AudioDiffusion(nn.Module):
                 boolean_encoder_mask = boolean_encoder_mask.repeat_interleave(num_samples_per_prompt, 0)
         elif self.task == "video2audio":
             batch_size = len(video) * num_samples_per_prompt
-            encoder_hidden_states, boolean_encoder_mask = self.encode_video_classifier_free(video, text, num_samples_per_prompt, device=device)
+            if classifier_free_guidance:
+                encoder_hidden_states, boolean_encoder_mask = self.encode_video_classifier_free(
+                    video, text, num_samples_per_prompt, device=device
+                )
+            else:
+                encoder_hidden_states, boolean_encoder_mask = self.encode_video(video, text, device)
+                encoder_hidden_states = encoder_hidden_states.repeat_interleave(num_samples_per_prompt, 0)
+                boolean_encoder_mask = boolean_encoder_mask.repeat_interleave(num_samples_per_prompt, 0)
         # import pdb;pdb.set_trace()
         #print("ldm time 1", time.time()-start)
         inference_scheduler.set_timesteps(num_steps, device=device)
         timesteps = inference_scheduler.timesteps
 
-        num_channels_latents = self.unet.in_channels
+        num_channels_latents = self.unet.config.in_channels
         latents = self.prepare_latents(batch_size, inference_scheduler, num_channels_latents, encoder_hidden_states.dtype, device)
         num_warmup_steps = len(timesteps) - num_steps * inference_scheduler.order
         progress_bar = tqdm(range(num_steps), disable=disable_progress)
@@ -586,24 +607,13 @@ class AudioDiffusion(nn.Module):
                 vid_fea = self.vid_fea_extractor(video=video.to(device))
             vid_feas.append(vid_fea)
         
-        padding = 0
-        size = max(v.size(0) for v in vid_feas)
-        batch_size = len(vid_feas)
-        embed_size = vid_feas[0].size(1)
-        encoder_hidden_states = vid_feas[0].new(batch_size, size, embed_size).fill_(padding)
-        boolean_encoder_mask = torch.ones((batch_size, size), dtype=torch.bool)
-
-        def copy_tensor(src, dst):
-            assert dst.numel() == src.numel()
-            dst.copy_(src)
-
-        for i, v in enumerate(vid_feas):
-            copy_tensor(v, encoder_hidden_states[i][: len(v)])
-            boolean_encoder_mask[i, len(v):] = False    
+        encoder_hidden_states, boolean_encoder_mask = self._pad_video_features(vid_feas, device)
+        encoder_hidden_states = encoder_hidden_states.repeat_interleave(num_samples_per_prompt, 0)
+        boolean_encoder_mask = boolean_encoder_mask.repeat_interleave(num_samples_per_prompt, 0)
 
         b, t, n = encoder_hidden_states.shape
         negative_prompt_embeds = encoder_hidden_states.new(b, t, n).fill_(0)
-        uncond_attention_mask = torch.ones((b, t), dtype=torch.bool)
+        uncond_attention_mask = torch.ones((b, t), dtype=torch.bool, device=device)
 
         negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_samples_per_prompt, 0)
         uncond_attention_mask = uncond_attention_mask.repeat_interleave(num_samples_per_prompt, 0)

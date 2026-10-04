@@ -1,0 +1,15 @@
+{
+  "original_args": "ckpt/vta-ldm-clip4clip-v-large/summary.jsonl",
+  "model": "ckpt/vta-ldm-clip4clip-v-large/pytorch_model_2.bin",
+  "scheduler_config": "configs/stable-diffusion-2-1.scheduler_48k.json",
+  "data_path": "data",
+  "save_dir": "outputs/minimal",
+  "num_steps": 20,
+  "guidance": 3.0,
+  "batch_size": 1,
+  "num_samples": 1,
+  "num_test_instances": 1,
+  "sample_rate": 16000,
+  "seed": 0,
+  "device": "auto"
+}

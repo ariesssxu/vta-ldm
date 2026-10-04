@@ -1,5 +1,5 @@
 # Video-to-Audio Generation with Hidden Alignment  
-Manjie Xu, Chenxing Li, Yong Ren, Rilin Chen, Yu Gu, Wei Liang, Dong Yu  
+Manjie Xu, Chenxing Li, Xinyi Tu, Yong Ren, Rilin Chen, Yu Gu, Wei Liang, Dong Yu  
 Tencent AI Lab  
 
 <a href='https://arxiv.org/abs/2407.07464'>
@@ -40,6 +40,25 @@ Put the video pieces into the `data` directory. Run the provided inference scrip
 ```
 bash inference_from_video.sh
 ```
+The default script is intentionally a small smoke run: it processes the first
+video with batch size 1 and 20 denoising steps. Its settings live in
+`configs/inference_minimal.json`. Before running it, install the inference-only
+dependencies and place the released checkpoint at the documented path:
+
+```
+python3.10 -m pip install -r requirements_inference.txt
+mkdir -p ckpt
+git clone https://huggingface.co/ariesssxu/vta-ldm-clip4clip-v-large \
+  ckpt/vta-ldm-clip4clip-v-large
+bash inference_from_video.sh
+```
+
+To scale up after the smoke run succeeds, override only the required values:
+
+```
+bash inference_from_video.sh --num_test_instances 5 --num_steps 100 --batch_size 2
+```
+
 You can custom the hyperparameters to fit your personal requirements. We also provide a script that can help merge the generated audio content with the original video based on ffmpeg:
 
 ```
@@ -86,4 +105,3 @@ This work is based on some of the great repos:
 ## Disclaimer
 
 This is not an official product by Tencent Ltd.
-
